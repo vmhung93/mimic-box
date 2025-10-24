@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mimic Box</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // Tailwind configuration for custom colors
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'success': '#10b981',
+                        'error': '#f87171',
+                        'warning': '#fbbf24',
+                        'info': '#3b82f6',
+                        'log-bg-dark': '#1f2937',
+                        'log-receive': '#a78bfa',
+                        'log-send': '#34d399',
+                        'log-timestamp': '#9ca3af',
+                    },
+                }
+            }
+        }
+    </script>
+</head>
+
+<body class="min-h-screen p-5 font-sans bg-gray-100">
+    <div class="container max-w-3xl mx-auto bg-white rounded-xl shadow-2xl overflow-hidden">
+        <div class="header p-6 text-center bg-white border-b border-gray-200">
+            <h1 class="text-2xl font-semibold mb-2 text-gray-800">Mimic Box</h1>
+            <span id="statusBadge"
+                class="status inline-block px-4 py-1 rounded-full text-sm font-semibold mt-2 bg-gray-500 text-white">Disconnected</span>
+        </div>
+
+        <div class="content p-6">
+            <div class="form-group mb-5">
+                <label for="wsBaseUrl" class="block mb-2 font-semibold text-gray-700">WebSocket Base URL</label>
+                <input type="text" id="wsBaseUrl" placeholder="e.g., wss://your-server.com/api/v2/iot"
+                    value="wss://iotm2wsbox-dev.kerb.app/api/v2/iot"
+                    class="w-full p-3 border-2 border-gray-200 rounded-lg text-sm focus:outline-none focus:border-gray-600 transition duration-300">
+            </div>
+
+            <div class="form-group mb-5">
+                <label for="serialNumber" class="block mb-2 font-semibold text-gray-700">Serial Number (SN)</label>
+                <input type="text" id="serialNumber" placeholder="e.g., 2025202501" value="2025202501"
+                    class="w-full p-3 border-2 border-gray-200 rounded-lg text-sm focus:outline-none focus:border-gray-600 transition duration-300">
+            </div>
+
+            <div class="form-group mb-5">
+                <label for="token" class="block mb-2 font-semibold text-gray-700">Token</label>
+                <input type="password" id="token" placeholder="Enter JWT token"
+                    value="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+                    class="w-full p-3 border-2 border-gray-200 rounded-lg text-sm focus:outline-none focus:border-gray-600 transition duration-300">
+            </div>
+
+            <div class="button-group flex gap-3 mb-6">
+                <button id="connectBtn"
+                    class="flex-1 px-6 py-3 border-none rounded-lg text-sm font-semibold cursor-pointer transition duration-300 text-white bg-success hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed">Connect</button>
+
+                <button id="disconnectBtn"
+                    class="flex-1 px-6 py-3 border-none rounded-lg text-sm font-semibold cursor-pointer transition duration-300 text-white bg-red-500 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled>Disconnect</button>
+
+                <button id="clearBtn"
+                    class="px-6 py-3 border-none rounded-lg text-sm font-semibold cursor-pointer transition duration-300 text-white bg-gray-500 hover:bg-gray-600">Clear
+                    Logs</button>
+            </div>
+
+            <div class="log-container bg-log-bg-dark rounded-lg p-4 max-h-96 overflow-y-auto font-mono text-xs"
+                id="logContainer">
+                <div class="log-entry log-info mb-2 p-2 rounded-md leading-relaxed text-white">
+                    <span class="timestamp text-log-timestamp text-3xs mr-2">........</span>Ready to connect...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Manual CBOR Encoding/Decoding Implementation
+        class CBORCodec {
+            static MAJOR_TYPE_INT = 0;
+            static MAJOR_TYPE_NEG_INT = 1;
+            static MAJOR_TYPE_BYTES = 2;
+            static MAJOR_TYPE_STRING = 3;
+            static MAJOR_TYPE_ARRAY = 4;
+            static MAJOR_TYPE_MAP = 5;
+            static MAJOR_TYPE_TAG = 6;
+            static MAJOR_TYPE_SIMPLE = 7;
+            static encode(value) {
+                const parts = [];
+                this._encodeValue(value, parts);
+
+                // Concatenate all parts into a single ArrayBuffer
+                const totalLength = parts.reduce((sum, part) => sum + part.length, 0);
+                const result = new Uint8Array(totalLength);
+                let offset = 0;
+                for (const part of parts) {
+                    result.set(part, offset);
+                    offset += part.length;
+                }
+                return result.buffer;
+            }
+
+            static _encodeValue(value, parts) {
+                if (value === null || value === undefined) {
+                    parts.push(new Uint8Array([0xf6])); // null
+                } else if (value === true) {
+                    parts.push(new Uint8Array([0xf5])); // true
+                } else if (value === false) {
+                    parts.push(new Uint8Array([0xf4])); // false
+                } else if (typeof value === 'number') {
+                    this._encodeNumber(value, parts);
+                } else if (typeof value === 'string') {
+                    this._encodeString(value, parts);
+                } else if (Array.isArray(value)) {
+                    this._encodeArray(value, parts);
+                } else if (typeof value === 'object') {
+                    this._encodeMap(value, parts);
+                }
+            }
+
+            static _encodeNumber(value, parts) {
+                if (Number.isInteger(value)) {
+                    if (value >= 0) {
+                        this._encodeInt(this.MAJOR_TYPE_INT, value, parts);
+                    } else {
+                        this._encodeInt(this.MAJOR_TYPE_NEG_INT, -1 - value, parts);
+                    }
+                } else {
+                    // Float64
+                    const buffer = new ArrayBuffer(9);
+                    const view = new DataView(buffer);
+                    view.setUint8(0, 0xfb); // float64
+                    view.setFloat64(1, value, false);
+                    parts.push(new Uint8Array(buffer));
+                }
+            }
+
+            static _encodeInt(majorType, value, parts) {
+                if (value < 24) {
+                    parts.push(new Uint8Array([(majorType << 5) | value]));
+                } else if (value < 256) {
+                    parts.push(new Uint8Array([(majorType << 5) | 24, value]));
+                } else if (value < 65536) {
+                    const buffer = new ArrayBuffer(3);
+                    const view = new DataView(buffer);
+                    view.setUint8(0, (majorType << 5) | 25);
+                    view.setUint16(1, value, false);
+                    parts.push(new Uint8Array(buffer));
+                } else if (value < 4294967296) {
+                    const buffer = new ArrayBuffer(5);
+                    const view = new DataView(buffer);
+                    view.setUint8(0, (majorType << 5) | 26);
+                    view.setUint32(1, value, false);
+                    parts.push(new Uint8Array(buffer));
+                } else {
+                    const buffer = new ArrayBuffer(9);
+                    const view = new DataView(buffer);
+                    view.setUint8(0, (majorType << 5) | 27);
+                    view.setBigUint64(1, BigInt(value), false);
+                    parts.push(new Uint8Array(buffer));
+                }
+            }
+
+            static _encodeString(str, parts) {
+                const utf8 = new TextEncoder().encode(str);
+                this._encodeInt(this.MAJOR_TYPE_STRING, utf8.length, parts);
+                parts.push(utf8);
+            }
+
+            static _encodeArray(arr, parts) {
+                this._encodeInt(this.MAJOR_TYPE_ARRAY, arr.length, parts);
+                for (const item of arr) {
+                    this._encodeValue(item, parts);
+                }
+            }
+
+            static _encodeMap(obj, parts) {
+                const keys = Object.keys(obj);
+                this._encodeInt(this.MAJOR_TYPE_MAP, keys.length, parts);
+                for (const key of keys) {
+                    this._encodeString(key, parts);
+                    this._encodeValue(obj[key], parts);
+                }
+            }
+
+            // Decode CBOR to JavaScript value
+            static decode(arrayBuffer) {
+                const data = new Uint8Array(arrayBuffer);
+                const result = this._decodeValue(data, 0);
+                return result.value;
+            }
+
+            static _decodeValue(data, offset) {
+                const initialByte = data[offset];
+                const majorType = initialByte >> 5;
+                const additionalInfo = initialByte & 0x1f;
+
+                switch (majorType) {
+                    case this.MAJOR_TYPE_INT:
+                        return this._decodeInt(data, offset, additionalInfo, false);
+                    case this.MAJOR_TYPE_NEG_INT:
+                        return this._decodeInt(data, offset, additionalInfo, true);
+                    case this.MAJOR_TYPE_BYTES:
+                        return this._decodeBytes(data, offset, additionalInfo);
+                    case this.MAJOR_TYPE_STRING:
+                        return this._decodeString(data, offset, additionalInfo);
+                    case this.MAJOR_TYPE_ARRAY:
+                        return this._decodeArray(data, offset, additionalInfo);
+                    case this.MAJOR_TYPE_MAP:
+                        return this._decodeMap(data, offset, additionalInfo);
+                    case this.MAJOR_TYPE_SIMPLE:
+                        return this._decodeSimple(data, offset, additionalInfo);
+                    default:
+                        throw new Error(`Unknown major type: ${majorType}`);
+                }
+            }
+
+            static _decodeInt(data, offset, additionalInfo, isNegative) {
+                let value, newOffset;
+
+                if (additionalInfo < 24) {
+                    value = additionalInfo;
+                    newOffset = offset + 1;
+                } else if (additionalInfo === 24) {
+                    value = data[offset + 1];
+                    newOffset = offset + 2;
+                } else if (additionalInfo === 25) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 2);
+                    value = view.getUint16(0, false);
+                    newOffset = offset + 3;
+                } else if (additionalInfo === 26) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 4);
+                    value = view.getUint32(0, false);
+                    newOffset = offset + 5;
+                } else if (additionalInfo === 27) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 8);
+                    value = Number(view.getBigUint64(0, false));
+                    newOffset = offset + 9;
+                } else {
+                    throw new Error(`Invalid additional info for integer: ${additionalInfo}`);
+                }
+
+                if (isNegative) {
+                    value = -1 - value;
+                }
+
+                return { value, offset: newOffset };
+            }
+
+            static _decodeBytes(data, offset, additionalInfo) {
+                const lengthResult = this._decodeLength(data, offset, additionalInfo);
+                const bytes = data.slice(lengthResult.offset, lengthResult.offset + lengthResult.value);
+                return { value: bytes, offset: lengthResult.offset + lengthResult.value };
+            }
+
+            static _decodeString(data, offset, additionalInfo) {
+                const lengthResult = this._decodeLength(data, offset, additionalInfo);
+                const bytes = data.slice(lengthResult.offset, lengthResult.offset + lengthResult.value);
+                const str = new TextDecoder().decode(bytes);
+                return { value: str, offset: lengthResult.offset + lengthResult.value };
+            }
+
+            static _decodeArray(data, offset, additionalInfo) {
+                const lengthResult = this._decodeLength(data, offset, additionalInfo);
+                const arr = [];
+                let currentOffset = lengthResult.offset;
+
+                for (let i = 0; i < lengthResult.value; i++) {
+                    const result = this._decodeValue(data, currentOffset);
+                    arr.push(result.value);
+                    currentOffset = result.offset;
+                }
+
+                return { value: arr, offset: currentOffset };
+            }
+
+            static _decodeMap(data, offset, additionalInfo) {
+                const lengthResult = this._decodeLength(data, offset, additionalInfo);
+                const obj = {};
+                let currentOffset = lengthResult.offset;
+
+                for (let i = 0; i < lengthResult.value; i++) {
+                    const keyResult = this._decodeValue(data, currentOffset);
+                    const valueResult = this._decodeValue(data, keyResult.offset);
+                    obj[keyResult.value] = valueResult.value;
+                    currentOffset = valueResult.offset;
+                }
+
+                return { value: obj, offset: currentOffset };
+            }
+
+            static _decodeSimple(data, offset, additionalInfo) {
+                if (additionalInfo === 20) {
+                    return { value: false, offset: offset + 1 };
+                } else if (additionalInfo === 21) {
+                    return { value: true, offset: offset + 1 };
+                } else if (additionalInfo === 22) {
+                    return { value: null, offset: offset + 1 };
+                } else if (additionalInfo === 23) {
+                    return { value: undefined, offset: offset + 1 };
+                } else if (additionalInfo === 27) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 8);
+                    return { value: view.getFloat64(0, false), offset: offset + 9 };
+                } else {
+                    throw new Error(`Unsupported simple value: ${additionalInfo}`);
+                }
+            }
+
+            static _decodeLength(data, offset, additionalInfo) {
+                if (additionalInfo < 24) {
+                    return { value: additionalInfo, offset: offset + 1 };
+                } else if (additionalInfo === 24) {
+                    return { value: data[offset + 1], offset: offset + 2 };
+                } else if (additionalInfo === 25) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 2);
+                    return { value: view.getUint16(0, false), offset: offset + 3 };
+                } else if (additionalInfo === 26) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 4);
+                    return { value: view.getUint32(0, false), offset: offset + 5 };
+                } else if (additionalInfo === 27) {
+                    const view = new DataView(data.buffer, data.byteOffset + offset + 1, 8);
+                    return { value: Number(view.getBigUint64(0, false)), offset: offset + 9 };
+                } else {
+                    throw new Error(`Invalid additional info for length: ${additionalInfo}`);
+                }
+            }
+        }
+
+        let ws = null;
+        let pingInterval = null;
+        let connectionData = {
+            sn: '',
+            token: ''
+        };
+
+        const statusBadge = document.getElementById('statusBadge');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const logContainer = document.getElementById('logContainer');
+        const wsBaseUrlInput = document.getElementById('wsBaseUrl');
+        const serialNumberInput = document.getElementById('serialNumber');
+        const tokenInput = document.getElementById('token');
+
+        // Helper function to update Tailwind log class names
+        function getLogClass(type) {
+            switch (type) {
+                case 'info':
+                    return 'text-white';
+                case 'success':
+                    return 'text-success';
+                case 'error':
+                    return 'text-error';
+                case 'warning':
+                    return 'text-warning';
+                case 'receive':
+                    return 'text-log-receive bg-log-receive/10';
+                case 'send':
+                    return 'text-log-send bg-log-send/10';
+                default:
+                    return 'text-white';
+            }
+        }
+
+        function log(message, type = 'info') {
+            const timestamp = new Intl.DateTimeFormat('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false // Ensures 24-hour format (HH)
+            }).format(new Date());
+
+            const entry = document.createElement('div');
+            entry.className = `log-entry mb-2 p-2 rounded-md leading-relaxed ${getLogClass(type)}`;
+            entry.innerHTML = `<span class="timestamp text-log-timestamp text-3xs mr-2">${timestamp}</span>${message}`;
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        function updateStatus(connected) {
+            if (connected) {
+                statusBadge.textContent = 'Connected';
+                statusBadge.className = 'status inline-block px-4 py-1 rounded-full text-sm font-semibold mt-2 text-white bg-success';
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+            } else {
+                statusBadge.textContent = 'Disconnected';
+                statusBadge.className = 'status inline-block px-4 py-1 rounded-full text-sm font-semibold mt-2 bg-gray-600 text-white';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+            }
+        }
+
+        function startHeartbeat() {
+            pingInterval = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    try {
+                        ws.send("ping");
+                        log('Heartbeat ping sent', 'info');
+                    } catch (e) {
+                        log(`Heartbeat error: ${e.message}`, 'error');
+                    }
+                } else if (ws && ws.readyState !== WebSocket.OPEN) {
+                    log('Connection lost during heartbeat check', 'warning');
+                    stopHeartbeat();
+                }
+            }, 15000); // Send every 15 seconds
+        }
+
+        function stopHeartbeat() {
+            if (pingInterval) {
+                clearInterval(pingInterval);
+                pingInterval = null;
+            }
+        }
+
+        function censorToken(token) {
+            if (token.length <= 8) {
+                return '********';
+            }
+
+            const prefix = token.substring(0, 4);
+            const suffix = token.substring(token.length - 10);
+            return `${prefix}....${suffix}`;
+        }
+
+        async function processMessage(msg) {
+            log(`Received: ${JSON.stringify(msg)}`, 'receive');
+
+            const respMsg = {
+                cid: msg.cid,
+                uid: msg.uid,
+                code: Math.floor(Math.random() * 2) // 0 or 1
+            };
+
+            // Updated to random from 1 to 2 seconds
+            const sleepTime = Math.floor(Math.random() * 2) + 1; // 1 or 2 seconds
+            console.info(`Sleep for ${sleepTime} seconds`);
+            await new Promise(resolve => setTimeout(resolve, sleepTime * 1000));
+
+            log(`Sending: ${JSON.stringify(respMsg)}`, 'send');
+
+            try {
+                const encoded = CBORCodec.encode(respMsg);
+                ws.send(encoded);
+                log('Response sent', 'success');
+            } catch (e) {
+                log(`Error sending response: ${e.message}`, 'error');
+            }
+        }
+
+        function connect() {
+            const baseUrl = wsBaseUrlInput.value.trim();
+            const sn = serialNumberInput.value.trim();
+            const token = tokenInput.value.trim();
+
+            if (!baseUrl || !sn || !token) {
+                log('Please enter Base URL, Serial Number, and Token', 'error');
+                return;
+            }
+
+            // Store in memory
+            connectionData.sn = sn;
+            connectionData.token = token;
+
+            // Construct URL using baseUrl
+            const wsUrl = `${baseUrl}?sn=${encodeURIComponent(sn)}&token=${encodeURIComponent(token)}`;
+
+            // Log the censored URL for security
+            const censoredUrl = `${baseUrl}?sn=${sn}&token=${censorToken(token)}`;
+            log(`Connecting to: ${censoredUrl}`, 'info');
+
+            try {
+                ws = new WebSocket(wsUrl);
+                ws.binaryType = 'arraybuffer';
+
+                ws.onopen = () => {
+                    log('Connected to server', 'success');
+                    updateStatus(true);
+                    startHeartbeat();
+                };
+
+                ws.onmessage = async (event) => {
+                    try {
+                        const decoded = CBORCodec.decode(event.data);
+                        await processMessage(decoded);
+                    } catch (e) {
+                        log(`Received non-CBOR response: ${event.data}`, 'warning');
+                        log(`Error: ${e.message}`, 'error');
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    log('WebSocket error: Check connection details', 'error');
+                    console.error(`WebSocket error: ${error}`);
+                };
+
+                ws.onclose = (event) => {
+                    if (event.wasClean) {
+                        log(`Connection closed cleanly, code=${event.code} reason=${event.reason}`, 'info');
+                    } else {
+                        let msg = `Connection terminated. Code: ${event.code}.`;
+
+                        // WebSocket standard close codes for common authorization/protocol issues:
+                        // 1006: Abnormally closed (no close frame sent/received)
+                        // 1008: Policy Violation (often used for token failure)
+                        // 1011: Server Error
+                        if (event.code === 1006) {
+                            msg += ' (Possible server rejection, firewall issue, or invalid data/token)';
+                        } else if (event.code === 1008) {
+                            msg = `Connection rejected by server (Policy Violation). Code: ${event.code}. (Likely an **Invalid Token** or URL issue)`;
+                        } else if (event.reason) {
+                            msg += ` Reason: "${event.reason}"`;
+                        }
+
+                        log(msg, 'error');
+                    }
+
+                    updateStatus(false);
+                    stopHeartbeat();
+                    ws = null;
+                };
+            } catch (e) {
+                log(`Connection error: ${e.message}`, 'error');
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                stopHeartbeat();
+                ws = null;
+                log('Disconnected by user', 'info');
+                updateStatus(false);
+            }
+        }
+
+        function clearLogs() {
+            logContainer.innerHTML = '<div class="log-entry mb-2 p-2 rounded-md leading-relaxed text-white"><span class="timestamp text-log-timestamp text-3xs mr-2">........</span>Logs cleared</div>';
+        }
+
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        clearBtn.addEventListener('click', clearLogs);
+
+        // Allow Enter key to connect
+        serialNumberInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') connect();
+        });
+
+        tokenInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') connect();
+        });
+    </script>
+</body>
+
+</html>
